@@ -198,26 +198,38 @@ class TableSynchronizer:
             raise
     
     def _sync_with_rowversion(self) -> Dict[str, int]:
-        """Sincronización solo INSERT usando ROWVERSION"""
+        """Sincronización completa con INSERT/UPDATE/DELETE usando ROWVERSION"""
         stats = {'inserted': 0, 'updated': 0, 'deleted': 0, 'errors': 0}
         
         pk_columns = self._get_primary_key_columns()
         where_clause = self._build_where_clause()
         
-        # Solo INSERTS: registros que están en origen pero no en destino
+        # 1. INSERTS: registros que están en origen pero no en destino
         stats['inserted'] = self._perform_inserts(pk_columns, where_clause)
+        
+        # 2. UPDATES: registros que existen en ambos pero con diferencias
+        stats['updated'] = self._perform_updates(pk_columns, where_clause)
+        
+        # 3. DELETES: registros que están en destino pero no en origen (respetando WHERE)
+        stats['deleted'] = self._perform_deletes(pk_columns, where_clause)
         
         return stats
     
     def _sync_with_hash(self) -> Dict[str, int]:
-        """Sincronización solo INSERT"""
+        """Sincronización completa con INSERT/UPDATE/DELETE"""
         stats = {'inserted': 0, 'updated': 0, 'deleted': 0, 'errors': 0}
         
         pk_columns = self._get_primary_key_columns()
         where_clause = self._build_where_clause()
         
-        # Solo INSERTS
+        # 1. INSERTS
         stats['inserted'] = self._perform_inserts(pk_columns, where_clause)
+        
+        # 2. UPDATES
+        stats['updated'] = self._perform_updates(pk_columns, where_clause)
+        
+        # 3. DELETES
+        stats['deleted'] = self._perform_deletes(pk_columns, where_clause)
         
         return stats
     
@@ -341,6 +353,187 @@ class TableSynchronizer:
         
         logger.info(f"{self.config.full_name}: {total_inserted:,} registros insertados")
         return total_inserted
+    
+    def _perform_updates(self, pk_columns: List[str], where_clause: str) -> int:
+        """
+        Actualiza registros que existen en ambos pero tienen diferencias
+        Estrategia: Fetch completo de ambos lados, comparar en Python
+        """
+        insertable_cols = self._get_insertable_columns()
+        cols_list = ', '.join([f"[{col}]" for col in insertable_cols])
+        pk_list = ', '.join([f"[{col}]" for col in pk_columns])
+        
+        # Columnas a comparar (no-PK)
+        compare_cols = [col for col in insertable_cols if col not in pk_columns]
+        
+        if not compare_cols:
+            logger.info(f"{self.config.full_name}: No hay columnas actualizables")
+            return 0
+        
+        logger.info(f"{self.config.full_name}: Comparando registros para UPDATE...")
+        
+        # 1. Obtener TODOS los datos de origen
+        fetch_query = f"""
+            SELECT {cols_list}
+            FROM [{self.config.schema}].[{self.config.table_name}]
+            {where_clause}
+        """
+        source_rows = self.source_db.execute_query(fetch_query)
+        
+        if not source_rows:
+            return 0
+        
+        logger.info(f"{self.config.full_name}: {len(source_rows):,} registros en origen")
+        
+        # 2. Obtener TODOS los datos de destino
+        dest_fetch_query = f"""
+            SELECT {cols_list}
+            FROM [{self.config.schema}].[{self.config.table_name}]
+        """
+        dest_rows = self.dest_db.execute_query(dest_fetch_query)
+        
+        logger.info(f"{self.config.full_name}: {len(dest_rows):,} registros en destino")
+        
+        # 3. Crear diccionario de destino por PK para lookup rápido
+        dest_dict = {}
+        for row in dest_rows:
+            pk_key = tuple([getattr(row, col) for col in pk_columns])
+            dest_dict[pk_key] = row
+        
+        # 4. Comparar todos los registros de origen con destino
+        rows_to_update = []
+        
+        for source_row in source_rows:
+            pk_key = tuple([getattr(source_row, col) for col in pk_columns])
+            
+            # Solo procesar si existe en destino
+            if pk_key in dest_dict:
+                dest_row = dest_dict[pk_key]
+                
+                # Comparar columnas no-PK
+                has_differences = False
+                for col in compare_cols:
+                    source_val = getattr(source_row, col, None)
+                    dest_val = getattr(dest_row, col, None)
+                    
+                    if source_val != dest_val:
+                        has_differences = True
+                        break
+                
+                if has_differences:
+                    rows_to_update.append(source_row)
+        
+        if not rows_to_update:
+            logger.info(f"{self.config.full_name}: No hay cambios para actualizar")
+            return 0
+        
+        logger.info(f"{self.config.full_name}: {len(rows_to_update):,} registros con cambios detectados")
+        
+        # 5. Ejecutar UPDATE en batches grandes
+        total_updated = 0
+        batch_size = 10000  # Batches grandes como en INSERT
+        
+        set_clause = ', '.join([f"[{col}] = ?" for col in compare_cols])
+        where_pk = ' AND '.join([f"[{col}] = ?" for col in pk_columns])
+        
+        update_stmt = f"""
+            UPDATE [{self.config.schema}].[{self.config.table_name}]
+            SET {set_clause}
+            WHERE {where_pk}
+        """
+        
+        for batch_start in range(0, len(rows_to_update), batch_size):
+            batch_rows = rows_to_update[batch_start:batch_start + batch_size]
+            
+            params_list = []
+            for row in batch_rows:
+                params = []
+                # Valores para SET (columnas no-PK)
+                for col in compare_cols:
+                    params.append(getattr(row, col))
+                # Valores para WHERE (PKs)
+                for col in pk_columns:
+                    params.append(getattr(row, col))
+                params_list.append(tuple(params))
+            
+            self.dest_db.execute_batch(update_stmt, params_list, commit=True)
+            updated_count = len(params_list)
+            total_updated += updated_count
+            
+            # Reportar progreso
+            if self.progress_callback:
+                progress_pct = int(((batch_start + updated_count) / len(rows_to_update)) * 100)
+                self.progress_callback('PROGRESS', batch_start + updated_count, len(rows_to_update), progress_pct)
+            
+            logger.debug(f"Batch UPDATE: {updated_count:,} registros actualizados ({total_updated:,}/{len(rows_to_update):,})")
+        
+        logger.info(f"{self.config.full_name}: {total_updated:,} registros actualizados")
+        return total_updated
+    
+    def _perform_deletes(self, pk_columns: List[str], where_clause: str) -> int:
+        """
+        Elimina registros que están en destino pero no en origen
+        IMPORTANTE: Solo elimina dentro del alcance del WHERE clause
+        """
+        pk_list = ', '.join([f"[{col}]" for col in pk_columns])
+        
+        # 1. Obtener PKs de origen (con WHERE si aplica)
+        logger.info(f"{self.config.full_name}: Verificando registros para DELETE...")
+        
+        source_pk_query = f"""
+            SELECT {pk_list}
+            FROM [{self.config.schema}].[{self.config.table_name}]
+            {where_clause}
+        """
+        source_pks = self.source_db.execute_query(source_pk_query)
+        
+        source_pk_set = set()
+        for row in source_pks:
+            key = tuple([getattr(row, col) for col in pk_columns])
+            source_pk_set.add(key)
+        
+        # 2. Obtener PKs de destino (con el MISMO WHERE para respetar alcance)
+        dest_pks = self.dest_db.execute_query(source_pk_query)
+        
+        # 3. Identificar registros a eliminar (en destino pero no en origen)
+        pks_to_delete = []
+        for row in dest_pks:
+            key = tuple([getattr(row, col) for col in pk_columns])
+            if key not in source_pk_set:
+                pks_to_delete.append(key)
+        
+        if not pks_to_delete:
+            logger.info(f"{self.config.full_name}: No hay registros para eliminar")
+            return 0
+        
+        logger.info(f"{self.config.full_name}: {len(pks_to_delete):,} registros a eliminar")
+        
+        # 4. Ejecutar DELETE en batches grandes
+        total_deleted = 0
+        batch_size = 10000  # Batches grandes
+        
+        where_pk = ' AND '.join([f"[{col}] = ?" for col in pk_columns])
+        delete_stmt = f"""
+            DELETE FROM [{self.config.schema}].[{self.config.table_name}]
+            WHERE {where_pk}
+        """
+        
+        for batch_start in range(0, len(pks_to_delete), batch_size):
+            batch_pks = pks_to_delete[batch_start:batch_start + batch_size]
+            
+            self.dest_db.execute_batch(delete_stmt, batch_pks, commit=True)
+            deleted_count = len(batch_pks)
+            total_deleted += deleted_count
+            
+            # Reportar progreso
+            if self.progress_callback:
+                progress_pct = int(((batch_start + deleted_count) / len(pks_to_delete)) * 100)
+                self.progress_callback('PROGRESS', batch_start + deleted_count, len(pks_to_delete), progress_pct)
+            
+            logger.debug(f"Batch DELETE: {deleted_count:,} registros eliminados ({total_deleted:,}/{len(pks_to_delete):,})")
+        
+        logger.info(f"{self.config.full_name}: {total_deleted:,} registros eliminados")
+        return total_deleted
 
 
 class SyncOrchestrator:
